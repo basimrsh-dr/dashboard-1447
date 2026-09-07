@@ -237,14 +237,16 @@ td{padding:9px 12px;font-size:.78rem;color:var(--text3);vertical-align:middle;}
   <div class="up-logo">📋</div>
   <div class="up-title">داشبورد متابعة تسليم ملفات المقررات</div>
   <div class="up-sub">قسم تقنيات التعليم — الفصل الدراسي الثاني 1447هـ</div>
-  <div style="margin-top:12px;display:flex;flex-direction:column;align-items:center;gap:16px;">
-    <button class="up-btn show" onclick="fetchFromSheets()" id="fetchBtn">
-      <span>🔄</span> تحميل أحدث البيانات
-    </button>
-    <div class="up-file-name" id="fetchStatus">يتصل بـ Google Sheets...</div>
-    <div class="up-note">
-      ⓘ البيانات تُحدَّث تلقائياً من نموذج التسليم — لا حاجة لرفع أي ملف
-    </div>
+  <label class="up-box" id="dropZone">
+    <input type="file" id="fileInput" accept=".xlsx,.xls,.csv" onchange="handleFile(this.files[0])">
+    <div class="up-icon">📁</div>
+    <div class="up-box-title">اسحب ملف الإكسل هنا أو اضغط للاختيار</div>
+    <div class="up-box-sub">ملف "التسليمات" المُصدَّر من Excel أو Google Sheets (xlsx / csv)</div>
+  </label>
+  <div class="up-file-name" id="fileName"></div>
+  <button class="up-btn" id="loadBtn" onclick="loadFile()">📊 عرض البيانات</button>
+  <div class="up-note">
+    ⓘ صدّر ورقة بيانات التسليمات كملف Excel وارفعه هنا — لا يُرسَل الملف لأي خادم، تتم القراءة محلياً داخل المتصفح
   </div>
 </div>
 
@@ -286,7 +288,7 @@ td{padding:9px 12px;font-size:.78rem;color:var(--text3);vertical-align:middle;}
     <span class="lg-item"><span class="lg-dot" style="background:var(--male-l)"></span>شطر الطلاب</span>
     <span class="lg-item"><span class="lg-dot" style="background:var(--female-l)"></span>شطر الطالبات</span>
     <span class="lg-item"><span class="lg-dot" style="background:var(--both-l)"></span>مدرس واحد لكلا الشطرين</span>
-    <span class="lg-info">63 تكليف إجمالاً: 28 مقرر × مدرسان (56) + 2 مدرس واحد للشطرين + 2 طلاب فقط + 3 طالبات فقط</span>
+    <span class="lg-info" id="lgInfo">—</span>
   </div>
 
   <!-- Stats -->
@@ -390,6 +392,7 @@ td{padding:9px 12px;font-size:.78rem;color:var(--text3);vertical-align:middle;}
 </main>
 </div>
 
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 <script>
 // ══════════════════════════════════════════════════════════════
 // MASTER COURSE LIST (from coordinator file)
@@ -448,110 +451,84 @@ const MALE_TOTAL   = ASGN.filter(a=>a.section==='male'||a.section==='both').leng
 const FEMALE_TOTAL = ASGN.filter(a=>a.section==='female'||a.section==='both').length;
 const GRAND_TOTAL  = ASGN.length;
 
-// Requirement column names (cols 12-21 in Excel, index 12..21)
+// Requirement columns — `key` is the phrase looked up (as a substring) in the uploaded file's
+// header row, in both the validator (REQ_NAMES below, kept in sync with this list) and the
+// "تفاصيل التسليمات" table renderer, so the two can never drift apart again.
 const REQ_COLS = [
-  {key:'توصيف',  label:'توصيف',   idx:12},
-  {key:'خطة',   label:'خطة',     idx:13},
-  {key:'تقرير', label:'تقرير',   idx:14},
-  {key:'درجات', label:'درجات',   idx:15},
-  {key:'اكسل',  label:'اكسل درجات', idx:16},
-  {key:'التزام',label:'التزام',   idx:17},
-  {key:'تقييم', label:'تقييم طلبة',idx:18},
-  {key:'نماذج', label:'نماذج أعمال',idx:19},
-  {key:'موحد',  label:'تقرير موحد', idx:21},
+  {key:'توصيف المقرر',       label:'توصيف'},
+  {key:'خطة المقرر',         label:'خطة'},
+  {key:'تقرير المقرر',       label:'تقرير'},
+  {key:'الدرجات النهائية',   label:'درجات'},
+  {key:'ملف اكسل الدرجات',   label:'اكسل درجات'},
+  {key:'نموذج الالتزام',     label:'التزام'},
+  {key:'تقييم الطلبة',       label:'تقييم طلبة'},
+  {key:'نماذج اعمال الطلبة', label:'نماذج أعمال'},
+  {key:'التقرير الموحد',     label:'تقرير موحد'},
 ];
 
-// ══ GOOGLE SHEETS CONFIG ══
-const SHEET_ID   = '1BPeAR15TffYJb052a2-oTGyZjPSLBkhKyl2K7Ulb10c';
-const GAS_URL    = 'https://script.google.com/macros/s/AKfycbzgFSqjcpJlZkyYRlcIilszuCpm5BaiWmqR1SbMNML8Uv4eixYg1gcNMO50xRROlczx/exec';
-const SHEET_NAME = 'التسليمات';
+const SHEET_NAME = 'التسليمات'; // preferred worksheet name inside the uploaded workbook, if present
 const VALID_CODES = new Set(COURSES.map(c => c.code.trim().toUpperCase()));
 
-// ── Auto-fetch on load ──
-window.addEventListener('load', () => {
-  setTimeout(fetchFromSheets, 600);
-});
+// ══ MANUAL FILE UPLOAD ══
+let rawFile = null;
 
-function fetchFromSheets() {
-  document.getElementById('fetchStatus').textContent = '⏳ جاري تحميل البيانات...';
-  document.getElementById('fetchBtn').disabled = true;
+function handleFile(file) {
+  if (!file) return;
+  rawFile = file;
+  document.getElementById('fileName').textContent = '📄 ' + file.name;
+  document.getElementById('loadBtn').classList.add('show');
+}
 
-  // JSONP via Apps Script — works from any host including SharePoint
-  const cbName = 'gsCb_' + Date.now();
-  const url = GAS_URL + '?callback=' + cbName;
+(function setupDropZone(){
+  const dz = document.getElementById('dropZone');
+  if (!dz) return;
+  ['dragover','dragenter'].forEach(ev => dz.addEventListener(ev, e => { e.preventDefault(); dz.classList.add('drag'); }));
+  ['dragleave','drop'].forEach(ev => dz.addEventListener(ev, e => { e.preventDefault(); dz.classList.remove('drag'); }));
+  dz.addEventListener('drop', e => {
+    const f = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+    if (f) {
+      try { document.getElementById('fileInput').files = e.dataTransfer.files; } catch(_) {}
+      handleFile(f);
+    }
+  });
+})();
 
-  const timer = setTimeout(() => {
-    cleanup();
-    document.getElementById('fetchBtn').disabled = false;
-    document.getElementById('fetchStatus').textContent = '❌ انتهت مهلة الاتصال — تأكد من إعدادات المشاركة في Google Sheets';
-  }, 20000);
+function loadFile() {
+  if (!rawFile) return;
+  document.getElementById('uploadScreen').style.display = 'none';
+  document.getElementById('loadScreen').style.display = 'flex';
 
-  function cleanup() {
-    clearTimeout(timer);
-    if (window[cbName]) delete window[cbName];
-    const s = document.getElementById('_gs_jsonp');
-    if (s) s.remove();
-  }
-
-  window[cbName] = function(json) {
-    cleanup();
+  const reader = new FileReader();
+  reader.onload = (e) => {
     try {
-      if (!json || json.status !== 'ok') throw new Error(json ? json.message : 'استجابة غير صحيحة');
-      const rows = parseGASResponse(json.data);
+      const data = new Uint8Array(e.target.result);
+      const wb = XLSX.read(data, { type: 'array', cellDates: true });
+      const sheetName = wb.SheetNames.includes(SHEET_NAME) ? SHEET_NAME : wb.SheetNames[0];
+      const ws = wb.Sheets[sheetName];
+      const rows = XLSX.utils.sheet_to_json(ws, { header: 1, raw: true, defval: null });
       const result = validateAndParse(rows);
-      document.getElementById('fetchBtn').disabled = false;
 
       if (result.fatal) {
-        document.getElementById('fetchStatus').textContent = '❌ ' + result.title;
         showValidation(result);
       } else if (result.warnings.length > 0 || result.unmatched.length > 0) {
-        document.getElementById('fetchStatus').textContent = '⚠️ تم التحميل مع تحذيرات';
         showValidation(result);
       } else {
-        document.getElementById('fetchStatus').textContent = '✅ تم التحميل بنجاح';
-        setTimeout(() => {
-          document.getElementById('uploadScreen').style.display = 'none';
-          document.getElementById('dashboard').style.display = 'block';
-          renderAll();
-        }, 500);
+        document.getElementById('loadScreen').style.display = 'none';
+        document.getElementById('dashboard').style.display = 'block';
+        renderAll();
       }
-    } catch(err) {
-      document.getElementById('fetchBtn').disabled = false;
-      document.getElementById('fetchStatus').textContent = '❌ خطأ: ' + err.message;
+    } catch (err) {
+      document.getElementById('loadScreen').style.display = 'none';
+      showValidation({ fatal:true, icon:'⚠️', title:'تعذّرت قراءة الملف', sub: err.message, errors:['تأكد أن الملف بصيغة Excel أو CSV صحيحة'], warnings:[], matched:0, unmatched:[] });
     }
   };
-
-  const script = document.createElement('script');
-  script.id = '_gs_jsonp';
-  script.src = url;
-  script.onerror = () => {
-    cleanup();
-    document.getElementById('fetchBtn').disabled = false;
-    document.getElementById('fetchStatus').textContent = '❌ فشل الاتصال — تأكد أن Apps Script منشور للعموم';
+  reader.onerror = () => {
+    document.getElementById('loadScreen').style.display = 'none';
+    showValidation({ fatal:true, icon:'⚠️', title:'تعذّرت قراءة الملف', sub:'', errors:['فشلت قراءة الملف من القرص'], warnings:[], matched:0, unmatched:[] });
   };
-  document.head.appendChild(script);
+  reader.readAsArrayBuffer(rawFile);
 }
 
-function parseGASResponse(data) {
-  // data is array of arrays from Apps Script [[header...],[row...],...]
-  return data;
-}
-
-
-function parseGVizResponse(json) {
-  const cols = json.table.cols.map(c => c.label);
-  const dataRows = [cols]; // header row first
-
-  json.table.rows.forEach(row => {
-    const r = row.c.map(cell => {
-      if (!cell || cell.v === null) return null;
-      return cell.v;
-    });
-    dataRows.push(r);
-  });
-
-  return dataRows;
-}
 
 // ══ VALIDATION + PARSE ══
 function normalizeCode(code) {
@@ -591,23 +568,22 @@ function validateAndParse(rows) {
   }
 
   const header = rows[0].map(h => h ? String(h).trim() : '');
-  const missingHeaders = REQUIRED_HEADERS.filter(h => !header.includes(h));
+  // Real form exports often pad headers with extra wording (or a stray NBSP), so match by
+  // "column text contains this key phrase" rather than requiring an exact string match.
+  const findCol = (needle) => header.findIndex(h => h.includes(needle));
+  const missingHeaders = REQUIRED_HEADERS.filter(h => findCol(h) < 0);
   if (missingHeaders.length > 0) {
     return { fatal:true, icon:'🗂️', title:'بنية البيانات غير صحيحة', sub:'أعمدة مطلوبة غير موجودة في ورقة التسليمات.', errors: missingHeaders.map(h=>`العمود "${h}" غير موجود`), warnings:[], matched:0, unmatched:[] };
   }
 
-  const iInst = header.indexOf('اسم مدرس المقرر');
-  const iSec  = header.indexOf('الشطر');
-  const iCode = header.indexOf('رمز المقرر');
+  const iInst = findCol('اسم مدرس المقرر');
+  const iSec  = findCol('الشطر');
+  const iCode = findCol('رمز المقرر');
 
-  // Req cols by header name
-  const REQ_NAMES = [
-    'توصيف المقرر','خطة المقرر','تقرير المقرر',
-    'الدرجات النهائية','ملف اكسل الدرجات',
-    'نموذج الالتزام','تقييم الطلبة',
-    'نماذج اعمال الطلبة','التقرير الموحد'
-  ];
-  const reqIndices = REQ_NAMES.map(n => ({ key:n, idx:header.indexOf(n) })).filter(r=>r.idx>=0);
+  // Req cols by header name (matched as a substring of the actual column header) —
+  // sourced from REQ_COLS so the parser and the renderer always agree on the same keys.
+  const REQ_NAMES = REQ_COLS.map(c => c.key);
+  const reqIndices = REQ_NAMES.map(n => ({ key:n, idx:findCol(n) })).filter(r=>r.idx>=0);
 
   ASGN.forEach(a => { a.submitted=false; a.submissionTime=null; a.requirements={}; });
 
@@ -630,7 +606,9 @@ function validateAndParse(rows) {
     if (!match) { warnings.push(`الصف ${i+1}: لا يوجد تكليف مطابق للرمز "${codeRaw}" والشطر`); unmatched.push({row:i+1,inst:instRaw,code:codeRaw,sec:row[iSec]||'—',reason:'لا تكليف مطابق'}); continue; }
 
     const reqs = {};
-    reqIndices.forEach(r => { reqs[r.key] = !!(row[r.idx]); });
+    // Keep the actual cell value (usually a SharePoint link) rather than collapsing it to a
+    // boolean, so the "تفاصيل التسليمات" tab can render a clickable link, not just a checkmark.
+    reqIndices.forEach(r => { reqs[r.key] = row[r.idx] || null; });
     const reqCount = Object.values(reqs).filter(Boolean).length;
 
     // Any row present = submitted (presence in sheet = submission)
@@ -705,7 +683,10 @@ function backToUpload() {
   document.getElementById('validScreen').style.display='none';
   document.getElementById('loadScreen').style.display ='none';
   document.getElementById('uploadScreen').style.display='flex';
-  fetchFromSheets();
+  rawFile = null;
+  document.getElementById('fileName').textContent = '';
+  document.getElementById('loadBtn').classList.remove('show');
+  document.getElementById('fileInput').value = '';
 }
 
 // ══ RENDER HELPERS ══
@@ -742,6 +723,17 @@ function ring(p,color,label,sub){
 
 // ══ RENDER ALL ══
 function renderAll(){
+  // Legend breakdown — computed from COURSES/ASGN so it can never drift from the live totals above it
+  const bothN=COURSES.filter(c=>c.male&&c.female&&c.male===c.female).length;
+  const maleOnlyN=COURSES.filter(c=>c.male&&!c.female).length;
+  const femaleOnlyN=COURSES.filter(c=>c.female&&!c.male).length;
+  const pairN=COURSES.length-bothN-maleOnlyN-femaleOnlyN;
+  document.getElementById('lgInfo').textContent=
+    `${GRAND_TOTAL} تكليف إجمالاً: ${pairN} مقرر × مدرسان (${pairN*2})`+
+    (bothN?` + ${bothN} مدرس واحد لكلا الشطرين`:'')+
+    (maleOnlyN?` + ${maleOnlyN} شطر طلاب فقط`:'')+
+    (femaleOnlyN?` + ${femaleOnlyN} شطر طالبات فقط`:'');
+
   const mSub=ASGN.filter(a=>(a.section==='male'||a.section==='both')&&a.submitted).length;
   const fSub=ASGN.filter(a=>(a.section==='female'||a.section==='both')&&a.submitted).length;
   const tot=ASGN.filter(a=>a.submitted).length;
@@ -868,15 +860,6 @@ function switchTab(id){
   document.querySelectorAll('.tab')[TIDS.indexOf(id)].classList.add('active');
 }
 
-function backToUpload(){
-  document.getElementById('dashboard').style.display  ='none';
-  document.getElementById('validScreen').style.display='none';
-  document.getElementById('loadScreen').style.display ='none';
-  document.getElementById('uploadScreen').style.display='flex';
-  rawFile=null;
-  document.getElementById('fileName').textContent='لم يتم اختيار ملف بعد';
-  document.getElementById('loadBtn').classList.remove('show');
-}
 </script>
 </body>
 </html>
